@@ -180,11 +180,11 @@ func ReturningClauseBuilder(c clause.Clause, builder clause.Builder) {
 	}
 }
 
-// LimitClauseBuilder builds the Oracle FETCH clause instead of using the default LIMIT syntax
-// The FETCH syntax is supported in Oracle 12c and later
+// LimitClauseBuilder builds the Oracle LIMIT/OFFSET clause using ROWNUM instead of the default LIMIT syntax
+// The ROWNUM syntax is supported in Oracle 11g and later
 func LimitClauseBuilder(c clause.Clause, builder clause.Builder) {
 	if limit, ok := c.Expression.(clause.Limit); ok {
-		// Convert LIMIT to Oracle FETCH syntax
+		// Convert LIMIT to Oracle ROWNUM syntax
 		if stmt, ok := builder.(*gorm.Statement); ok {
 			buildOracleFetchLimit(limit, builder, stmt)
 		}
@@ -237,44 +237,82 @@ func ValuesClauseBuilder(c clause.Clause, builder clause.Builder) {
 	}
 }
 
-// buildOracleFetchLimit builds Oracle FETCH clause (Oracle 12c+)
+// buildOracleFetchLimit builds Oracle LIMIT/OFFSET clause using ROWNUM (supports Oracle 11g+)
 func buildOracleFetchLimit(limit clause.Limit, builder clause.Builder, stmt *gorm.Statement) {
 	// Check if ORDER BY exists when we have LIMIT/OFFSET
 	hasLimit := limit.Limit != nil && *limit.Limit >= 0
 	hasOffset := limit.Offset > 0
 
+	// For Oracle 11g, we need to use subquery with ROWNUM
+	// We'll modify the SQL directly in the statement
 	if hasLimit || hasOffset {
-		if _, hasOrderBy := stmt.Clauses["ORDER BY"]; !hasOrderBy {
-			builder.WriteString("ORDER BY ")
+		// Save the current SQL
+		originalSQL := stmt.SQL.String()
+		originalVars := make([]interface{}, len(stmt.Vars))
+		copy(originalVars, stmt.Vars)
+
+		// Clear current SQL and start building the new query
+		stmt.SQL.Reset()
+		stmt.Vars = stmt.Vars[:0]
+
+		// Check if we need ORDER BY
+		hasOrderBy := false
+		if _, ok := stmt.Clauses["ORDER BY"]; ok {
+			hasOrderBy = true
+		}
+
+		// Build the inner query with ORDER BY if needed
+		stmt.WriteString("SELECT * FROM (")
+		if hasOrderBy {
+			// If ORDER BY exists, we need to wrap it in another subquery
+			stmt.WriteString("SELECT * FROM (")
+		}
+
+		// Add the original SQL
+		stmt.WriteString(originalSQL)
+
+		// Add ORDER BY if not present
+		if !hasOrderBy {
+			stmt.WriteString(" ORDER BY ")
 			if stmt.Schema != nil && stmt.Schema.PrioritizedPrimaryField != nil {
-				builder.WriteQuoted(stmt.Schema.PrioritizedPrimaryField.DBName)
-				builder.WriteString(" ")
+				stmt.WriteQuoted(stmt.Schema.PrioritizedPrimaryField.DBName)
 			} else {
-				builder.WriteString("1 ")
+				stmt.WriteString("1")
 			}
 		}
-	}
 
-	// Build OFFSET clause if specified
-	if hasOffset {
-		builder.WriteString("OFFSET ")
-		builder.WriteString(strconv.Itoa(limit.Offset))
-		if limit.Offset == 1 {
-			builder.WriteString(" ROW ")
+		// Close the inner subquery if we added ORDER BY wrapper
+		if hasOrderBy {
+			stmt.WriteString(") WHERE ROWNUM <= ")
 		} else {
-			builder.WriteString(" ROWS ")
+			stmt.WriteString(" WHERE ROWNUM <= ")
 		}
-	}
 
-	// Build FETCH clause if limit is specified
-	if hasLimit {
-		builder.WriteString("FETCH NEXT ")
-		builder.WriteString(strconv.Itoa(*limit.Limit))
-		if *limit.Limit == 1 {
-			builder.WriteString(" ROW ONLY")
-		} else {
-			builder.WriteString(" ROWS ONLY")
+		// Calculate the upper limit
+		upperLimit := 0
+		if hasLimit {
+			upperLimit = *limit.Limit
 		}
+		if hasOffset {
+			upperLimit += limit.Offset
+		}
+		// If no limit specified but has offset, set a large upper limit
+		if !hasLimit && hasOffset {
+			upperLimit = 999999999 // A large number
+		}
+
+		// Add the upper limit
+		stmt.WriteString(strconv.Itoa(upperLimit))
+		stmt.WriteString(") ")
+
+		// Add the outer query for OFFSET
+		if hasOffset {
+			stmt.WriteString("WHERE ROWNUM > ")
+			stmt.WriteString(strconv.Itoa(limit.Offset))
+		}
+
+		// Restore the original variables
+		stmt.Vars = append(stmt.Vars, originalVars...)
 	}
 }
 
